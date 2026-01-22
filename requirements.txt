@@ -1,2 +1,6 @@
-psycopg2-binary
 requests
+sqlalchemy
+geoalchemy2
+psycopg2-binary
+shapely
+python-dotenv
