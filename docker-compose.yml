@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gis
+    ports:
+      - "5432:5432"
+
+  initializer:
+    build: .
+    depends_on:
+      - postgis
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgis:5432/gis
