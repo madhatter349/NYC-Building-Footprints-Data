@@ -11,8 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# --- FIX: Handle SQLAlchemy protocol mismatch ---
+# Railway provides 'postgres://', but SQLAlchemy 1.4+ requires 'postgresql://'
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not found in .env file")
+    raise ValueError("DATABASE_URL not found. Make sure it is set in .env or Railway variables.")
 
 # 2. Database Setup
 Base = declarative_base()
@@ -36,8 +41,8 @@ class NycBuilding(Base):
 # Connect to DB
 engine = create_engine(DATABASE_URL)
 
-# Create the table if it doesn't exist (also adds the PostGIS extension if needed)
-# Note: Ensure 'CREATE EXTENSION postgis;' was run on your DB. Railway usually does this by default.
+# Create the table if it doesn't exist
+# This will also ensure the PostGIS extension functions are available
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 session = Session()
@@ -51,10 +56,11 @@ def process_feature(feature):
     props = feature['properties']
     geo = feature['geometry']
 
-    # Convert GeoJSON geometry to WKB (Well Known Binary) for PostGIS using Shapely
+    # Convert GeoJSON geometry to WKT (Well Known Text) for PostGIS using Shapely
+    # This handles the conversion from the API's JSON format to what the DB expects
     shapely_geom = shape(geo)
     
-    # Handle data type conversion safely
+    # Handle data type conversion safely (handle None or empty strings)
     try:
         c_year = int(props.get('construction_year')) if props.get('construction_year') else None
     except ValueError:
@@ -64,22 +70,27 @@ def process_feature(feature):
         h_roof = float(props.get('height_roof')) if props.get('height_roof') else None
     except ValueError:
         h_roof = None
+    
+    try:
+        d_id = int(props.get('doitt_id')) if props.get('doitt_id') else None
+    except ValueError:
+        d_id = None
 
     return NycBuilding(
         bin=props.get('bin'),
         base_bbl=props.get('base_bbl'),
         construction_year=c_year,
         height_roof=h_roof,
-        doitt_id=int(props.get('doitt_id')) if props.get('doitt_id') else None,
+        doitt_id=d_id,
         raw_properties=props,
-        geom=shapely_geom.wkt  # GeoAlchemy will handle the WKT conversion
+        geom=shapely_geom.wkt 
     )
 
 def run_scraper():
     offset = 0
     total_inserted = 0
     
-    print("🚀 Starting Scraper...")
+    print("Starting Scraper...")
 
     while True:
         # Fetch data with pagination
@@ -90,42 +101,56 @@ def run_scraper():
         }
         
         try:
+            print(f"Fetching offset {offset}...")
             response = requests.get(API_ENDPOINT, params=params)
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            print(f"❌ API Error: {e}")
+            print(f"API Error: {e}")
             break
 
         features = data.get('features', [])
         
         if not features:
-            print("✅ No more data found. Scraping complete.")
+            print("No more data found. Scraping complete.")
             break
 
         # Process batch
         new_objects = []
+        
+        # Get list of BINs in this batch to minimize DB queries
+        batch_bins = [f['properties'].get('bin') for f in features if f['properties'].get('bin')]
+        
+        # Check which BINs already exist in DB
+        existing_bins = set()
+        if batch_bins:
+            existing_records = session.query(NycBuilding.bin).filter(NycBuilding.bin.in_(batch_bins)).all()
+            existing_bins = {r[0] for r in existing_records}
+
         for feat in features:
-            # Check if BIN already exists to prevent duplicates (Simple check)
-            # For high performance, use 'ON CONFLICT DO NOTHING' in raw SQL, 
-            # but this is safer for a basic script.
             bin_id = feat['properties'].get('bin')
-            exists = session.query(NycBuilding).filter_by(bin=bin_id).first()
             
-            if not exists:
+            # Only add if it doesn't exist
+            if bin_id not in existing_bins:
                 new_objects.append(process_feature(feat))
+                # Add to set so we don't try to add duplicates within the same batch
+                existing_bins.add(bin_id)
 
         if new_objects:
-            session.add_all(new_objects)
-            session.commit()
-            total_inserted += len(new_objects)
-            print(f"🔹 Offset {offset}: Inserted {len(new_objects)} buildings.")
+            try:
+                session.add_all(new_objects)
+                session.commit()
+                total_inserted += len(new_objects)
+                print(f"Offset {offset}: Inserted {len(new_objects)} buildings.")
+            except Exception as e:
+                session.rollback()
+                print(f"DB Error on offset {offset}: {e}")
         else:
-            print(f"🔸 Offset {offset}: Skipped (All exist).")
+            print(f"Offset {offset}: Skipped (All exist).")
 
         offset += BATCH_SIZE
 
-    print(f"🎉 Finished! Total records inserted: {total_inserted}")
+    print(f"Finished! Total records inserted: {total_inserted}")
 
 if __name__ == "__main__":
     run_scraper()
